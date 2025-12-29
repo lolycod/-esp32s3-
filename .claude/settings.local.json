@@ -44,7 +44,10 @@
       "Bash(git commit:*)",
       "Bash(git ls-tree:*)",
       "mcp__fetch__fetch",
-      "Bash(cp:*)"
+      "Bash(cp:*)",
+      "Bash(git ls-remote:*)",
+      "Bash(git fetch:*)",
+      "Bash(git submodule status:*)"
     ],
     "deny": [],
     "ask": []
