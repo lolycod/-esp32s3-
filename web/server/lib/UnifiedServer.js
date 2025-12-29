@@ -152,6 +152,12 @@ class UnifiedServer {
             const parsedUrl = url.parse(req.url, true);
             let pathname = parsedUrl.pathname;
 
+            // MJPEG视频流代理（MaixCAM）
+            if (pathname === '/maixcam_stream') {
+                this.handleMJPEGProxy(req, res);
+                return;
+            }
+
             // API路由处理
             if (pathname.startsWith('/api/')) {
                 this.handleAPIRequest(req, res, pathname, parsedUrl);
@@ -183,6 +189,106 @@ class UnifiedServer {
             console.error('处理HTTP请求时出错:', error);
             this.send500(res, error.message);
         }
+    }
+
+    /**
+     * 处理MJPEG视频流代理（从MaixCAM转发）
+     * @param {http.IncomingMessage} req - 请求对象
+     * @param {http.ServerResponse} res - 响应对象
+     */
+    handleMJPEGProxy(req, res) {
+        // MaixCAM的IP地址和端口
+        const MAIXCAM_IP = '192.168.31.43';
+        const MAIXCAM_MJPEG_PORT = 8000;
+
+        console.log(`🎥 MJPEG代理请求 - 目标: http://${MAIXCAM_IP}:${MAIXCAM_MJPEG_PORT}`);
+
+        // 创建到MaixCAM的HTTP请求
+        const proxyReq = http.request({
+            host: MAIXCAM_IP,
+            port: MAIXCAM_MJPEG_PORT,
+            path: '/',
+            method: 'GET',
+            headers: {
+                'User-Agent': 'Node.js MJPEG Proxy'
+            }
+        }, (proxyRes) => {
+            console.log(`✅ MJPEG代理连接成功 - 状态码: ${proxyRes.statusCode}`);
+
+            // 设置CORS和MJPEG响应头
+            res.writeHead(proxyRes.statusCode, {
+                'Content-Type': proxyRes.headers['content-type'] || 'multipart/x-mixed-replace; boundary=frame',
+                'Access-Control-Allow-Origin': '*',
+                'Cache-Control': 'no-cache',
+                'Connection': 'close',
+                'Pragma': 'no-cache'
+            });
+
+            // 管道转发数据
+            proxyRes.pipe(res);
+
+            // 处理连接错误
+            proxyRes.on('error', (error) => {
+                console.error('❌ MJPEG代理响应错误:', error.message);
+                if (!res.headersSent) {
+                    res.writeHead(502, { 'Content-Type': 'text/plain' });
+                }
+                res.end('MJPEG stream error');
+            });
+        });
+
+        // 处理代理请求错误
+        proxyReq.on('error', (error) => {
+            console.error('❌ MJPEG代理请求失败:', error.message);
+            console.error(`   - 目标地址: http://${MAIXCAM_IP}:${MAIXCAM_MJPEG_PORT}`);
+            console.error('   - 可能原因: MaixCAM未启动或网络不可达');
+
+            if (!res.headersSent) {
+                res.writeHead(503, {
+                    'Content-Type': 'text/html; charset=utf-8',
+                    'Access-Control-Allow-Origin': '*'
+                });
+            }
+            res.end(`
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <title>MJPEG代理错误</title>
+                    <meta charset="utf-8">
+                    <style>
+                        body { font-family: Arial, sans-serif; text-align: center; padding: 50px; background: #1a1a2e; color: #eee; }
+                        h1 { color: #ff3b30; }
+                        .error-box { background: rgba(255,59,48,0.1); border: 1px solid #ff3b30; padding: 20px; border-radius: 8px; margin: 20px auto; max-width: 600px; }
+                        code { background: rgba(0,0,0,0.3); padding: 2px 6px; border-radius: 4px; }
+                    </style>
+                </head>
+                <body>
+                    <h1>⚠️ MJPEG视频流不可用</h1>
+                    <div class="error-box">
+                        <p><strong>无法连接到MaixCAM设备</strong></p>
+                        <p>目标地址: <code>http://${MAIXCAM_IP}:${MAIXCAM_MJPEG_PORT}</code></p>
+                        <p>错误信息: ${error.message}</p>
+                    </div>
+                    <p>请检查：</p>
+                    <ul style="text-align: left; max-width: 500px; margin: 20px auto;">
+                        <li>MaixCAM是否正常运行</li>
+                        <li>MaixCAM的IP地址是否正确（当前配置: ${MAIXCAM_IP}）</li>
+                        <li>MJPEG服务器是否已启动（端口${MAIXCAM_MJPEG_PORT}）</li>
+                        <li>网络连接是否正常</li>
+                    </ul>
+                </body>
+                </html>
+            `);
+        });
+
+        // 处理客户端断开连接
+        req.on('close', () => {
+            console.log('📡 客户端断开MJPEG连接，终止代理');
+            proxyReq.destroy();
+        });
+
+        // 发送代理请求
+        proxyReq.end();
     }
 
     /**
@@ -682,15 +788,25 @@ class UnifiedServer {
      * @param {Buffer} data - 消息数据
      */
     handleMessage(ws, data) {
-        // 使用MessageHandler处理消息
-        const result = this.messageHandler.processMessage(ws, data);
+        // 尝试解析为JSON文本消息
+        try {
+            const text = data.toString('utf8');
+            const message = JSON.parse(text);
 
-        if (!result.success) {
-            // 发送错误消息给发送者
-            this.sendError(ws, result.error);
-            console.error('❌ 消息处理失败:', result.error);
+            // 成功解析为JSON，说明是文本消息
+            const result = this.messageHandler.processMessage(ws, data);
+
+            if (!result.success) {
+                // 发送错误消息给发送者
+                this.sendError(ws, result.error);
+                console.error('❌ 消息处理失败:', result.error);
+            }
+            // 成功的情况下，MessageHandler已经处理了转发逻辑
+        } catch (e) {
+            // 解析失败，说明是binary消息（JPEG图像帧）
+            console.log(`📷 接收到图像帧: ${data.length} 字节`);
+            this.broadcastBinary(data, ws);
         }
-        // 成功的情况下，MessageHandler已经处理了转发逻辑
     }
 
     /**
@@ -860,6 +976,35 @@ class UnifiedServer {
 
         // 使用ConnectionManager广播消息
         this.connectionManager.broadcastToAll(broadcastMessage, excludeConnectionId);
+    }
+
+    /**
+     * 广播二进制数据给所有连接的客户端（用于JPEG图像帧）
+     * @param {Buffer} binaryData - 二进制数据
+     * @param {WebSocket} excludeWs - 要排除的连接（可选）
+     */
+    broadcastBinary(binaryData, excludeWs = null) {
+        const connections = this.connectionManager.getConnections();
+        let sentCount = 0;
+
+        connections.forEach(conn => {
+            // 跳过发送者和未就绪的连接
+            if (conn.ws === excludeWs || conn.ws.readyState !== 1) {
+                return;
+            }
+
+            try {
+                // 发送二进制数据
+                conn.ws.send(binaryData, { binary: true });
+                sentCount++;
+            } catch (error) {
+                console.error(`❌ 发送图像帧失败 (${conn.id}):`, error.message);
+            }
+        });
+
+        if (sentCount > 0) {
+            console.log(`✅ 图像帧已转发给 ${sentCount} 个客户端`);
+        }
     }
 
     /**

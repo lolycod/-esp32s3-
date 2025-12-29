@@ -18,6 +18,7 @@
                 <button class="btn-switch active" onclick="switchToAIMode()">AI对话</button>
                 <button class="btn-switch" onclick="switchToSensorMode()">传感器监控</button>
                 <button class="btn-switch" onclick="switchToControlMode()">控制模式</button>
+                <button class="btn-switch" onclick="switchToVisionMode()">🎥 视觉检测</button>
             </div>
         </header>
 
@@ -84,9 +85,27 @@
                 }
 
                 this.sharedWs.onmessage = (event) => {
+                    // 检查是否为二进制消息（JPEG图像帧）
+                    if (event.data instanceof Blob) {
+                        console.log('📷 收到图像帧:', event.data.size, '字节');
+                        // 仅在vision模式下处理图像帧
+                        if (this.currentMode === 'vision') {
+                            this.handleVisionImageFrame(event.data);
+                        }
+                        return;
+                    }
+
+                    // 文本消息处理
                     console.log('📥 收到消息:', event.data);
                     try {
                         const message = JSON.parse(event.data);
+
+                        // AI检测数据 - 发送到vision模式
+                        if (message.type === 'ai_detection' && this.currentMode === 'vision') {
+                            this.handleVisionTextMessage(message);
+                            return;
+                        }
+
                         // 处理传感器数据消息（同时更新所有页面）
                         if (message.type === 'message' && message.data && typeof message.data === 'object') {
                             // 保存最后的数据
@@ -100,6 +119,11 @@
                             if (tempEl && message.data.temperature !== undefined) {
                                 tempEl.textContent = `${message.data.temperature.toFixed(1)}°C`;
                             }
+                        }
+
+                        // 系统消息 - 发送到vision模式
+                        if (message.type === 'system' && this.currentMode === 'vision') {
+                            this.handleVisionTextMessage(message);
                         }
                     } catch (e) {
                         console.error('消息解析失败:', e);
@@ -176,6 +200,9 @@
                 disconnectButtons.forEach(btn => {
                     if (btn) btn.disabled = !connected;
                 });
+
+                // 更新 vision 模式的状态
+                this.updateVisionStatus(connected);
             }
 
             sendMessage(data) {
@@ -903,7 +930,8 @@
                     if (
                         (activeMode === 'ai' && index === 0) ||
                         (activeMode === 'sensor' && index === 1) ||
-                        (activeMode === 'control' && index === 2)
+                        (activeMode === 'control' && index === 2) ||
+                        (activeMode === 'vision' && index === 3)
                     ) {
                         btn.classList.add('active');
                     }
@@ -971,6 +999,219 @@
                 // 使用共享断开
                 this.disconnectSharedWebSocket();
             }
+
+            switchToVisionMode() {
+                this.currentMode = 'vision';
+                this.updateModeButtons('vision');
+
+                const main = document.getElementById('mainContent');
+                main.innerHTML = `
+                    <section class="vision-section">
+                        <div class="vision-container" style="max-width: 1400px; margin: 0 auto;">
+                            <h2 style="text-align: center; color: var(--text-primary); margin-bottom: 20px;">🎥 实时视觉检测</h2>
+
+                            <!-- 状态栏 -->
+                            <div style="display: flex; justify-content: space-between; align-items: center; padding: 15px 25px; background: rgba(0, 243, 255, 0.05); border-radius: 10px; margin-bottom: 25px;">
+                                <div style="display: flex; align-items: center; gap: 10px;">
+                                    <div id="visionStatusDot" style="width: 12px; height: 12px; border-radius: 50%; background: var(--neon-red);"></div>
+                                    <span id="visionStatusText">未连接</span>
+                                </div>
+                                <div style="display: flex; gap: 20px;">
+                                    <span id="visionFpsCounter">FPS: 0</span>
+                                    <span id="visionLatencyCounter">延迟: 0ms</span>
+                                </div>
+                            </div>
+
+                            <!-- 主内容区域 -->
+                            <div style="display: grid; grid-template-columns: 2fr 1fr; gap: 25px; margin-bottom: 25px;">
+                                <!-- 视频显示区域 -->
+                                <div style="position: relative; background: #000; border-radius: 15px; overflow: hidden; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);">
+                                    <canvas id="visionCanvas" width="640" height="480" style="width: 100%; height: auto; display: block;"></canvas>
+                                    <div style="position: absolute; top: 15px; left: 15px; background: rgba(0, 0, 0, 0.7); color: white; padding: 10px 15px; border-radius: 8px; font-size: 14px;">
+                                        <div id="visionFrameInfo">等待视频流...</div>
+                                    </div>
+                                </div>
+
+                                <!-- 检测面板 -->
+                                <div style="background: rgba(0, 243, 255, 0.05); border-radius: 15px; padding: 25px;">
+                                    <!-- 统计卡片 -->
+                                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 20px;">
+                                        <div id="visionHumanCard" class="device-card" style="text-align: center; padding: 20px;">
+                                            <div id="visionHumanCount" style="font-size: 2.5em; font-weight: bold; color: var(--neon-blue);">0</div>
+                                            <div style="color: var(--text-secondary); font-size: 0.9em; margin-top: 5px;">👤 检测到人</div>
+                                        </div>
+                                        <div id="visionFireCard" class="device-card" style="text-align: center; padding: 20px;">
+                                            <div id="visionFireCount" style="font-size: 2.5em; font-weight: bold; color: var(--neon-red);">0</div>
+                                            <div style="color: var(--text-secondary); font-size: 0.9em; margin-top: 5px;">🔥 检测到火</div>
+                                        </div>
+                                    </div>
+
+                                    <!-- 检测日志 -->
+                                    <div class="device-card" style="padding: 15px;">
+                                        <h3 style="margin-bottom: 10px; font-size: 1.1em;">检测日志</h3>
+                                        <div id="visionLogContainer" class="log-container" style="max-height: 300px; overflow-y: auto;"></div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- 控制按钮 -->
+                            <div style="display: flex; gap: 15px; justify-content: center;">
+                                <button id="visionConnectBtn" class="btn-primary" style="display: none;">连接</button>
+                                <button id="visionDisconnectBtn" class="btn-secondary" style="display: none;">断开</button>
+                            </div>
+
+                            <!-- 调试信息 -->
+                            <div id="visionDebugInfo" class="log-container" style="margin-top: 20px; font-family: monospace; font-size: 0.85em; max-height: 150px;"></div>
+                        </div>
+                    </section>
+                `;
+
+                // 初始化视觉检测
+                this.setupVisionMode();
+            }
+
+            setupVisionMode() {
+                // 初始化Canvas
+                this.visionCanvas = document.getElementById('visionCanvas');
+                this.visionCtx = this.visionCanvas ? this.visionCanvas.getContext('2d') : null;
+                this.visionFrameCount = 0;
+                this.visionLastFrameTime = Date.now();
+
+                // 自动使用共享连接
+                if (this.isConnected) {
+                    this.updateVisionStatus(true);
+                    this.addVisionDebug('✅ 已使用共享WebSocket连接');
+                    this.addVisionLog('系统', '已连接到服务器');
+                } else {
+                    // 自动连接
+                    this.addVisionDebug('🔗 自动连接WebSocket...');
+                    this.connectSharedWebSocket(this.wsServer, this.wsPort);
+                }
+            }
+
+            updateVisionStatus(connected) {
+                const statusDot = document.getElementById('visionStatusDot');
+                const statusText = document.getElementById('visionStatusText');
+
+                if (statusDot && statusText) {
+                    if (connected) {
+                        statusDot.style.background = 'var(--neon-green)';
+                        statusDot.style.boxShadow = '0 0 10px rgba(0, 255, 157, 0.5)';
+                        statusText.textContent = '已连接';
+                    } else {
+                        statusDot.style.background = 'var(--neon-red)';
+                        statusDot.style.boxShadow = 'none';
+                        statusText.textContent = '未连接';
+                    }
+                }
+            }
+
+            addVisionDebug(message) {
+                const debugInfo = document.getElementById('visionDebugInfo');
+                if (!debugInfo) return;
+
+                const now = new Date().toLocaleTimeString();
+                const newLine = `[${now}] ${message}\n`;
+                debugInfo.textContent = newLine + debugInfo.textContent;
+
+                // 限制行数
+                const lines = debugInfo.textContent.split('\n');
+                if (lines.length > 10) {
+                    debugInfo.textContent = lines.slice(0, 10).join('\n');
+                }
+            }
+
+            addVisionLog(type, message, isFire = false) {
+                const logContainer = document.getElementById('visionLogContainer');
+                if (!logContainer) return;
+
+                const now = new Date();
+                const timeStr = now.toLocaleTimeString();
+
+                const logEntry = document.createElement('div');
+                logEntry.style.padding = '8px 12px';
+                logEntry.style.marginBottom = '8px';
+                logEntry.style.borderRadius = '5px';
+                logEntry.style.fontSize = '0.85em';
+                logEntry.style.borderLeft = isFire ? '4px solid var(--neon-red)' : '4px solid var(--neon-blue)';
+                logEntry.style.background = isFire ? 'rgba(255, 0, 85, 0.1)' : 'rgba(0, 243, 255, 0.1)';
+                logEntry.textContent = `[${timeStr}] ${type}: ${message}`;
+
+                logContainer.insertBefore(logEntry, logContainer.firstChild);
+
+                // 限制日志数量
+                while (logContainer.children.length > 20) {
+                    logContainer.removeChild(logContainer.lastChild);
+                }
+            }
+
+            handleVisionImageFrame(blob) {
+                if (!this.visionCanvas || !this.visionCtx) return;
+
+                this.addVisionDebug(`📷 收到图像帧: ${blob.size} 字节`);
+
+                const img = new Image();
+                img.onload = () => {
+                    this.visionCanvas.width = img.width;
+                    this.visionCanvas.height = img.height;
+                    this.visionCtx.drawImage(img, 0, 0);
+                    URL.revokeObjectURL(img.src);
+                };
+                img.src = URL.createObjectURL(blob);
+
+                // 更新FPS
+                this.visionFrameCount++;
+                const now = Date.now();
+                const elapsed = (now - this.visionLastFrameTime) / 1000;
+                if (elapsed >= 1.0) {
+                    const fps = this.visionFrameCount / elapsed;
+                    const fpsCounter = document.getElementById('visionFpsCounter');
+                    if (fpsCounter) {
+                        fpsCounter.textContent = `FPS: ${fps.toFixed(1)}`;
+                    }
+                    this.visionFrameCount = 0;
+                    this.visionLastFrameTime = now;
+                }
+
+                // 更新帧信息
+                const frameInfo = document.getElementById('visionFrameInfo');
+                if (frameInfo) {
+                    frameInfo.textContent = `图像大小: ${(blob.size / 1024).toFixed(1)} KB`;
+                }
+            }
+
+            handleVisionTextMessage(data) {
+                this.addVisionDebug(`处理消息类型: ${data.type}`);
+
+                if (data.type === 'ai_detection') {
+                    const detections = data.data.detections;
+                    let humans = 0;
+                    let fires = 0;
+
+                    detections.forEach(det => {
+                        if (det.class_id === 0) humans++;
+                        else fires++;
+                    });
+
+                    this.addVisionDebug(`🎯 检测: ${humans}人, ${fires}火`);
+
+                    // 更新统计卡片
+                    const humanCountEl = document.getElementById('visionHumanCount');
+                    const fireCountEl = document.getElementById('visionFireCount');
+                    if (humanCountEl) humanCountEl.textContent = humans;
+                    if (fireCountEl) fireCountEl.textContent = fires;
+
+                    // 添加日志
+                    if (humans > 0) {
+                        this.addVisionLog('检测', `发现 ${humans} 个人`, false);
+                    }
+                    if (fires > 0) {
+                        this.addVisionLog('警告', `检测到火焰 ${fires} 处`, true);
+                    }
+                } else if (data.type === 'system') {
+                    this.addVisionLog('系统', data.data);
+                }
+            }
         }
 
         // 全局函数
@@ -984,6 +1225,10 @@
 
         function switchToControlMode() {
             modeManager.switchToControlMode();
+        }
+
+        function switchToVisionMode() {
+            modeManager.switchToVisionMode();
         }
 
         // 控制模式全局函数
